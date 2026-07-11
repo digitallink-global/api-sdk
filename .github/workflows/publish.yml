@@ -1,0 +1,26 @@
+# 发包:push tag v* → npm 包发 GitHub Packages。
+# Python 不发 registry(GitHub Packages 无 PyPI 支持,官方已放弃该计划)——用户 pip from git 按 tag 安装。
+name: publish
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+  packages: write
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+      - name: build + publish
+        working-directory: ts
+        run: |
+          npm ci || npm install
+          npm run build
+          npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,477 @@
+openapi: 3.0.3
+info:
+  title: Public API
+  version: "1.0"
+  description: |
+    公开编程访问面（`/api/v1`）。设计依据 `progress/API开放平台.设计.md` rev2。
+    （注意与同目录 `openapi.yaml` 区分：那份是 console 私有契约的内部合同，无对外稳定性承诺；
+    本文件才是公开面的对外合同——**v1 内只加字段不删改**。）
+
+    ## 鉴权
+    `Authorization: Bearer <api_key>`，key 在控制台「API 密钥」页创建（明文仅创建时展示一次）。
+    key 锚定创建者：创建者被移出组织或账号被禁用，key 立即失效。
+
+    ## Scope
+    资源级 scope：`vm:read` / `vm:write` / `account:read` / `catalog:read`。缺 scope 返 403，key 无效返 401。
+
+    ## 限流
+    per-key 固定窗口（默认 120 req/min，运营可调）。超限返 429 + `Retry-After`。
+
+    ## 约定
+    - 成功 `{"data": {...}}`；错误 `{"error": {"code": "...", "message": "..."}}`
+    - 金额字段 `*_nanos` 为**字符串**（10⁻⁹ 美元，防 JS Number 精度丢失）
+    - 时间戳 int64 UTC 毫秒；ID 为 UUID v4（36 字符）
+    - `X-Request-Id` 自动注入响应头，排障时提供给客服
+servers:
+  - url: https://app.dgnlinks.com/api/v1
+security:
+  - apiKey: []
+
+paths:
+  /account:
+    get:
+      summary: whoami——回显当前 key 的身份/scope/限额
+      operationId: getAccount
+      tags: [Account]
+      description: 需要 scope `account:read`。CLI/SDK 冒烟验证用。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      organization_id: { type: string, format: uuid }
+                      user_id: { type: string, format: uuid, description: key 创建者 }
+                      role: { type: string, enum: [owner, member] }
+                      scopes:
+                        type: array
+                        items: { type: string }
+                      rate_limit_per_min: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /skus:
+    get:
+      summary: 列出可购 SKU（含 sku_version_id 与价格）
+      operationId: listSkus
+      tags: [Catalog]
+      description: |
+        需要 scope `catalog:read`。分页四字段契约。
+        `versions[].id` 即创建 VM 时 `order_lines[].sku_version_id` 用的值。
+        暂不支持按可用区过滤——请结合 `GET /zones` 的 `effective_sellable` 自行判断。
+      parameters:
+        - { name: resource_type, in: query, schema: { type: string, enum: [vm_bundle, disk, eip] }, description: 按资源类型过滤 }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Sku" }
+                      total: { type: integer }
+                      limit: { type: integer }
+                      offset: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /skus/{code}:
+    get:
+      summary: 按 code 查单个 SKU
+      operationId: getSku
+      tags: [Catalog]
+      description: 需要 scope `catalog:read`。
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string }, example: vm.c1a.x2medium }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Sku" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /zones:
+    get:
+      summary: 列出可用区
+      operationId: listZones
+      tags: [Catalog]
+      description: |
+        Returns all zones, not paginated（非分页全量，数据量小）。
+        需要 scope `catalog:read`。`id` 即创建 VM 时 `vm_configuration.zone_id` 用的值；
+        `effective_sellable=false` 的可用区暂不可下单。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Zone" }
+                      total: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /images:
+    get:
+      summary: 列出操作系统镜像
+      operationId: listImages
+      tags: [Catalog]
+      description: |
+        Returns all images, not paginated（非分页全量）。
+        需要 scope `catalog:read`。`code` 即创建 VM 时 `vm_configuration.image_code` 用的值。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Image" }
+                      total: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /vms:
+    get:
+      summary: 列出 VM
+      operationId: listVms
+      tags: [VMs]
+      description: 需要 scope `vm:read`。分页四字段契约。
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Vm" }
+                      total: { type: integer }
+                      limit: { type: integer }
+                      offset: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      summary: 创建 VM（下单 + 立即钱包扣款 + 开始交付）
+      operationId: createVm
+      tags: [VMs]
+      description: |
+        需要 scope `vm:write`。**一次调用直接从钱包扣款**并开始交付；
+        `Idempotency-Key` 必填——同 key 重试幂等回放（200），不会二次扣款。
+        余额不足返 422 `insufficient_balance`（订单保留，可充值后在控制台支付）。
+        返回后轮询 `GET /vms/{id}` 直到 `status=active`。
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_lines]
+              properties:
+                order_lines:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [sku_version_id, quantity, vm_configuration]
+                    properties:
+                      sku_version_id: { type: string, format: uuid, description: 已发布的 VM SKU version id }
+                      quantity: { type: integer, minimum: 1 }
+                      auto_renew: { type: boolean, default: false }
+                      vm_configuration:
+                        type: object
+                        required: [zone_id, image_code, auth]
+                        properties:
+                          zone_id: { type: string, format: uuid }
+                          image_code: { type: string, example: debian_12 }
+                          hostname: { type: string }
+                          system_disk_gib: { type: integer, example: 40 }
+                          auth:
+                            type: object
+                            description: password 或 public_keys 二选一
+                            properties:
+                              method: { type: string, enum: [password, ssh_key] }
+                              password: { type: string }
+                              public_keys:
+                                type: array
+                                items: { type: string }
+                          data_disks:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                size_gib: { type: integer }
+                                storage_type: { type: string }
+                          eip:
+                            type: object
+                            properties:
+                              enabled: { type: boolean }
+                              bandwidth_mbps: { type: integer }
+                              network_type: { type: string }
+      responses:
+        "201":
+          description: 已扣款并开始交付
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/VmCreateResult" }
+        "200":
+          description: 幂等重放（同 Idempotency-Key 已成功处理过）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/VmCreateResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422":
+          description: 余额不足（insufficient_balance）或支付失败（payment_failed）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /vms/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: VM 详情
+      operationId: getVm
+      tags: [VMs]
+      description: 需要 scope `vm:read`。含实时状态/IP/关联盘与 EIP。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/Vm" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: 销毁 VM（按本周期剩余比例退款）
+      operationId: deleteVm
+      tags: [VMs]
+      description: |
+        需要 scope `vm:write`。异步销毁，返回 task_ids 供追踪。
+        `release_eip=true`（默认）一并释放绑定的 EIP。
+      parameters:
+        - { name: release_eip, in: query, schema: { type: boolean, default: true } }
+      responses:
+        "200": { $ref: "#/components/responses/TaskAccepted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /vms/{id}/start:
+    post:
+      summary: 开机
+      operationId: startVm
+      tags: [VMs]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { $ref: "#/components/responses/TaskAccepted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /vms/{id}/stop:
+    post:
+      summary: 关机
+      operationId: stopVm
+      tags: [VMs]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { $ref: "#/components/responses/TaskAccepted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /vms/{id}/restart:
+    post:
+      summary: 重启
+      operationId: restartVm
+      tags: [VMs]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { $ref: "#/components/responses/TaskAccepted" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: "API key（mp_live_... / mp_test_...），控制台「API 密钥」页创建"
+
+  schemas:
+    Sku:
+      type: object
+      description: 可购商品（enabled 状态；含已发布计费版本）
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: vm.c1a.x2medium }
+        resource_type: { type: string, enum: [vm_bundle, disk, eip] }
+        display_name: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        versions:
+          type: array
+          description: 已发布计费版本；下单用 versions[].id 作 sku_version_id
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid, description: 即 sku_version_id }
+              billing_model: { type: string, example: fixed_cycle }
+              billing_cycle: { type: string, enum: [hourly, monthly, yearly] }
+              price_nanos: { type: string, description: 字符串 nanos（10⁻⁹ 美元） }
+
+    Zone:
+      type: object
+      properties:
+        id: { type: string, format: uuid, description: 即 vm_configuration.zone_id }
+        code: { type: string }
+        name: { type: string }
+        name_zh: { type: string, nullable: true }
+        region: { type: string }
+        region_zh: { type: string, nullable: true }
+        zone_type: { type: string, enum: [professional, shared] }
+        display_name: { type: string }
+        effective_sellable: { type: boolean }
+
+    Image:
+      type: object
+      properties:
+        code: { type: string, example: debian_12, description: 即 vm_configuration.image_code }
+        os: { type: string, example: Debian }
+        version: { type: string, example: "12" }
+        display_name: { type: string, nullable: true }
+        description: { type: string }
+
+    Vm:
+      type: object
+      description: VM 聚合视图（console 同源；字段只增不删）
+      properties:
+        id: { type: string, format: uuid, description: 所有 VM 操作端点用的资源 id }
+        status: { type: string, description: provisioning/active/suspended/deleting 等 }
+        hostname: { type: string, nullable: true }
+        zone_code: { type: string, nullable: true }
+        spec_name: { type: string, nullable: true }
+        private_ip: { type: string, nullable: true }
+        public_ip: { type: string, nullable: true }
+        created_at: { type: integer, format: int64, description: UTC ms }
+
+    VmCreateResult:
+      type: object
+      properties:
+        order_id: { type: string, format: uuid }
+        vm_id: { type: string, format: uuid, nullable: true, description: "轮询 GET /vms/{vm_id}" }
+        status: { type: string, enum: [provisioning] }
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { nullable: true }
+
+  responses:
+    TaskAccepted:
+      description: 已受理（异步），按 task_ids 追踪或轮询 VM 详情
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: object
+                properties:
+                  task_ids:
+                    type: array
+                    items: { type: string }
+    BadRequest:
+      description: 参数错误 / 缺 Idempotency-Key
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: key 缺失/无效/过期/已吊销/创建者失效
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: 缺所需 scope
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: 资源不存在或不属于当前组织（不区分，防探测）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: VM 处于过渡态（provisioning/deleting 等）暂不可操作
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
